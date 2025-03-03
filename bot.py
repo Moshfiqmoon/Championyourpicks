@@ -10,12 +10,12 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '7900055310:AAGswliYMf8-ZA8BhhQpES1Ju2oQollvko4')
+API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', 7933828542))
 STRIPE_API_KEY = os.getenv('STRIPE_API_KEY')
 WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
-WEEKLY_PAYMENT_LINK = os.getenv('WEEKLY_PAYMENT_LINK', 'https://buy.stripe.com/test_00gcPf5NOfa6eBO001')
-BIWEEKLY_PAYMENT_LINK = os.getenv('BIWEEKLY_PAYMENT_LINK', 'https://buy.stripe.com/test_cN216x4JK4vs3Xa28a')
+WEEKLY_PAYMENT_LINK = os.getenv('WEEKLY_PAYMENT_LINK', '')
+BIWEEKLY_PAYMENT_LINK = os.getenv('BIWEEKLY_PAYMENT_LINK', '')
 TEST_USER_ID = 7761809923  # Test user for picks
 
 # Validate required environment variables

@@ -10,13 +10,12 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '')
+API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '7900055310:AAGswliYMf8-ZA8BhhQpES1Ju2oQollvko4')
 ADMIN_ID = int(os.getenv('ADMIN_ID', 7933828542))
 STRIPE_API_KEY = os.getenv('STRIPE_API_KEY')
 WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
-WEEKLY_PAYMENT_LINK = os.getenv('WEEKLY_PAYMENT_LINK', '')
-BIWEEKLY_PAYMENT_LINK = os.getenv('BIWEEKLY_PAYMENT_LINK', '')
 TEST_USER_ID = 7761809923  # Test user for picks
+DOMAIN = os.getenv('DOMAIN', '')  # Add your domain to .env
 
 # Validate required environment variables
 required_vars = {'TELEGRAM_API_TOKEN': API_TOKEN, 'STRIPE_API_KEY': STRIPE_API_KEY, 'STRIPE_WEBHOOK_SECRET': WEBHOOK_SECRET}
@@ -44,16 +43,10 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS users 
                      (user_id INTEGER PRIMARY KEY, 
                       subscription_end TEXT,
-                      payment_status TEXT)''')
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN payment_link TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN referral_code TEXT")
-            c.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
-        except sqlite3.OperationalError:
-            pass
+                      payment_status TEXT,
+                      payment_link TEXT,
+                      referral_code TEXT,
+                      referred_by INTEGER)''')
         conn.commit()
     logger.info("Database initialized or updated")
 
@@ -166,21 +159,53 @@ def use_referral_code(user_id, code):
         logger.error(f"Error using referral code for user {user_id}: {e}")
         return False
 
+# Stripe Checkout Session Creation
+def create_checkout_session(user_id, period):
+    price = 5000 if period == "week" else 8000  # In cents
+    days = 7 if period == "week" else 14
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'unit_amount': price,
+                    'product_data': {
+                        'name': f'{period.capitalize()} VIP Subscription',
+                    },
+                },
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url=f'{DOMAIN}/success',
+            cancel_url=f'{DOMAIN}/cancel',
+            metadata={'user_id': str(user_id), 'days': str(days)}
+        )
+        return session.url
+    except Exception as e:
+        logger.error(f"Error creating checkout session for user {user_id}: {e}")
+        return None
+
 # Bot utility functions
-def send_payment_link(user_id, link, price, period):
+def send_payment_link(user_id, period):
     if is_subscribed(user_id):
         bot.send_message(user_id, "🏆 You’re already a VIP member! Enjoy your perks!")
         return
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(f"Pay ${price}/{period}", url=link))
-    markup.add(telebot.types.InlineKeyboardButton("🔙 Back to Menu", callback_data='back_to_main'))
-    bot.send_message(user_id, f"💰 Unlock premium sports picks for just ${price}/{period}! Click below:", reply_markup=markup)
+    price = 50 if period == "week" else 80
+    checkout_url = create_checkout_session(user_id, period)
+    if not checkout_url:
+        bot.send_message(user_id, "❌ Error generating payment link. Try again later.")
+        return
     try:
         with sqlite3.connect('users.db') as conn:
             c = conn.cursor()
             c.execute("INSERT OR REPLACE INTO users (user_id, payment_status, payment_link) VALUES (?, ?, ?)",
-                      (user_id, 'pending', link))
+                      (user_id, 'pending', checkout_url))
             conn.commit()
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(f"Pay ${price}/{period}", url=checkout_url))
+        markup.add(telebot.types.InlineKeyboardButton("🔙 Back to Menu", callback_data='back_to_main'))
+        bot.send_message(user_id, f"💰 Unlock premium sports picks for just ${price}/{period}! Click below:", reply_markup=markup)
         logger.info(f"Pending subscription set for user {user_id} with {period} plan")
     except Exception as e:
         logger.error(f"Error setting pending subscription for user {user_id}: {e}")
@@ -190,22 +215,18 @@ def format_picks(nba_picks, nfl_picks, mlb_picks, parlay_pick):
     current_date = datetime.now().strftime('%Y-%m-%d')
     formatted_picks = f"📢 Exclusive Sports Picks – {current_date}\n\n"
     formatted_picks += "🔥 Top Analyst Picks 🔥\n\n"
-
     formatted_picks += "🏀 NBA Picks\n"
     for pick in nba_picks:
         formatted_picks += f"✅ {pick}\n"
     formatted_picks += "\n"
-
     formatted_picks += "🏈 NFL Picks\n"
     for pick in nfl_picks:
         formatted_picks += f"✅ {pick}\n"
     formatted_picks += "\n"
-
     formatted_picks += "⚾ MLB Picks\n"
     for pick in mlb_picks:
         formatted_picks += f"✅ {pick}\n"
     formatted_picks += "\n"
-
     formatted_picks += f"🎯 Expert Parlay of the Day\n"
     formatted_picks += f"💰 {parlay_pick}\n\n"
     formatted_picks += "🔔 Risk Management Tip: Always bet responsibly and manage your bankroll wisely.\n\n"
@@ -266,7 +287,7 @@ def send_welcome(message):
     clean_expired_subscriptions()
     user_id = message.from_user.id
 
-    # Automatically subscribe user 7761809923 for testing
+    # Automatically subscribe test user
     if user_id == TEST_USER_ID:
         set_test_user_subscription(user_id)
 
@@ -290,9 +311,9 @@ def handle_callback(call):
 
     # User commands
     if data == 'sub_weekly':
-        send_payment_link(user_id, WEEKLY_PAYMENT_LINK, 50, "week")
+        send_payment_link(user_id, "week")
     elif data == 'sub_biweekly':
-        send_payment_link(user_id, BIWEEKLY_PAYMENT_LINK, 80, "bi-weekly")
+        send_payment_link(user_id, "bi-weekly")
     elif data == 'picks':
         if not is_subscribed(user_id):
             bot.answer_callback_query(call.id, "🔒 Subscribe to unlock premium picks!")
@@ -355,7 +376,7 @@ def handle_callback(call):
         - Expert picks for ALL sports! 🏀🏈⚾🏒🎾
         - Weekly ($50) or Bi-Weekly ($80) VIP plans
         - Refer friends for bonuses! 🎁
-        - Questions? Contact @YourSupportHandle
+        - Questions? Contact +12023205120
         Let’s win BIG together! 🚀
         """
         bot.send_message(user_id, help_text, reply_markup=back_button)
@@ -375,7 +396,7 @@ def handle_callback(call):
             if not subscribers:
                 bot.send_message(user_id, "👥 No subscribers found.", reply_markup=back_button)
                 return
-            response = "👥 Active Subscribers:\n"
+            response = "👥 Subscriber Details:\n"
             for sub_id, sub_end, status in subscribers:
                 response += f"ID: {sub_id}, End: {sub_end}, Status: {status}\n"
             bot.send_message(user_id, response, reply_markup=back_button)
@@ -404,16 +425,12 @@ def broadcast_picks(message):
         bot.send_message(message.chat.id, "❌ Please enter exactly 7 lines: 2 NBA, 2 NFL, 2 MLB, 1 Parlay!", reply_markup=back_button)
         return
 
-    # Extract picks
-    nba_picks = picks_input[0:2]  # Lines 1-2
-    nfl_picks = picks_input[2:4]  # Lines 3-4
-    mlb_picks = picks_input[4:6]  # Lines 5-6
-    parlay_pick = picks_input[6]  # Line 7
-
-    # Format picks
+    nba_picks = picks_input[0:2]
+    nfl_picks = picks_input[2:4]
+    mlb_picks = picks_input[4:6]
+    parlay_pick = picks_input[6]
     formatted_picks = format_picks(nba_picks, nfl_picks, mlb_picks, parlay_pick)
 
-    # Send to test user only (7761809923)
     try:
         bot.send_message(TEST_USER_ID, formatted_picks)
         bot.send_message(message.chat.id, f"📤 Picks sent to test user {TEST_USER_ID}!", reply_markup=back_button)
@@ -451,19 +468,27 @@ def webhook():
         logger.error(f"Webhook verification failed: {e}")
         return 'Invalid request', 400
 
-    if event['type'] == 'charge.succeeded':
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        user_id = session.get('metadata', {}).get('user_id')
+        days = int(session.get('metadata', {}).get('days', 7))  # Default to 7 if missing
+        if not user_id:
+            logger.error("No user_id in metadata")
+            return 'No user_id', 400
+
         try:
             with sqlite3.connect('users.db') as conn:
                 c = conn.cursor()
-                c.execute("SELECT user_id, payment_link FROM users WHERE payment_status='pending'")
-                pending_users = c.fetchall()
-                for user_id, payment_link in pending_users:
-                    if payment_link in [WEEKLY_PAYMENT_LINK, BIWEEKLY_PAYMENT_LINK]:
-                        days = 7 if payment_link == WEEKLY_PAYMENT_LINK else 14
-                        update_subscription(user_id, days, payment_link)
-            logger.info("Webhook processed successful payment")
+                c.execute("SELECT payment_link FROM users WHERE user_id=? AND payment_status='pending'", (int(user_id),))
+                result = c.fetchone()
+                if result:
+                    payment_link = result[0]
+                    update_subscription(int(user_id), days, payment_link)
+                    logger.info(f"Webhook updated subscription for user {user_id} with {days} days")
+                else:
+                    logger.error(f"User {user_id} not found or not pending")
         except Exception as e:
-            logger.error(f"Webhook processing error: {e}")
+            logger.error(f"Webhook processing error for user {user_id}: {e}")
     return 'Success', 200
 
 # Run bot and webhook server

@@ -447,13 +447,22 @@ def broadcast_picks(message):
     formatted_picks += "🔔 Risk Management Tip: Always bet responsibly and manage your bankroll wisely.\n"
     formatted_picks += "🚀 Stay ahead. Stay winning!"
 
-    try:
-        bot.send_message(TEST_USER_ID, formatted_picks)
-        bot.send_message(message.chat.id, f"📤 Picks sent to test user {TEST_USER_ID}!", reply_markup=back_button)
-        logger.info(f"Admin sent picks to test user {TEST_USER_ID}")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Failed to send picks to test user: {e}", reply_markup=back_button)
-        logger.error(f"Failed to send picks to test user {TEST_USER_ID}: {e}")
+    # Get all active subscribers
+    subscribers = get_all_subscribers()
+    if not subscribers:
+        bot.send_message(message.chat.id, "❌ No active subscribers found!", reply_markup=back_button)
+        return
+
+    successful_sends = 0
+    for sub_id in subscribers:
+        try:
+            bot.send_message(sub_id, formatted_picks)
+            successful_sends += 1
+        except Exception as e:
+            logger.error(f"Failed to send picks to {sub_id}: {e}")
+
+    bot.send_message(message.chat.id, f"📤 Picks sent to {successful_sends} out of {len(subscribers)} active subscribers!", reply_markup=back_button)
+    logger.info(f"Admin sent picks to {successful_sends} out of {len(subscribers)} active subscribers")
 
 def remove_subscriber(message):
     if message.from_user.id != ADMIN_ID:
@@ -478,7 +487,6 @@ def manually_activate_subscription(message):
         return
     back_button = get_back_button(is_admin=True)
     try:
-        # Expect input in format: "user_id days" (e.g., "123456789 7")
         user_id, days = map(int, message.text.split())
         if days <= 0:
             bot.send_message(message.chat.id, "❌ Days must be a positive number!", reply_markup=back_button)

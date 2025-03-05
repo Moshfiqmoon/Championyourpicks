@@ -15,7 +15,7 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', 7933828542))
 STRIPE_API_KEY = os.getenv('STRIPE_API_KEY')
 WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 TEST_USER_ID = 7761809923  # Test user for picks
-DOMAIN = os.getenv('DOMAIN', '')  # Add your domain to .env
+DOMAIN = os.getenv('DOMAIN', 'http://localhost:4242')  # Default to localhost for testing
 
 # Validate required environment variables
 required_vars = {'TELEGRAM_API_TOKEN': API_TOKEN, 'STRIPE_API_KEY': STRIPE_API_KEY, 'STRIPE_WEBHOOK_SECRET': WEBHOOK_SECRET}
@@ -210,7 +210,7 @@ def send_payment_link(user_id, period):
     except Exception as e:
         logger.error(f"Error setting pending subscription for user {user_id}: {e}")
 
-# Preformatted picks template for admin
+# Preformatted picks template (optional, no longer required)
 def format_picks(nba_picks, nfl_picks, mlb_picks, parlay_pick):
     current_date = datetime.now().strftime('%Y-%m-%d')
     formatted_picks = f"📢 Exclusive Sports Picks – {current_date}\n\n"
@@ -287,7 +287,6 @@ def send_welcome(message):
     clean_expired_subscriptions()
     user_id = message.from_user.id
 
-    # Automatically subscribe test user
     if user_id == TEST_USER_ID:
         set_test_user_subscription(user_id)
 
@@ -384,12 +383,11 @@ def handle_callback(call):
     # Admin commands
     elif user_id == ADMIN_ID:
         if data == 'admin_sendpicks':
-            bot.send_message(user_id, "📤 Enter picks (7 lines):\n"
-                                     "1. NBA Pick 1\n2. NBA Pick 2\n"
-                                     "3. NFL Pick 1\n4. NFL Pick 2\n"
-                                     "5. MLB Pick 1\n6. MLB Pick 2\n"
-                                     "7. Parlay Pick\n"
-                                     "Example: Lakers +5.5 (-110)", reply_markup=back_button)
+            bot.send_message(user_id, "📤 Type your picks below (any format, as many lines as you want):\n"
+                                     "Example:\n"
+                                     "NBA: Lakers +5.5 (-110)\n"
+                                     "NFL: Chiefs -3 (-105)\n"
+                                     "Parlay: Lakers ML + Chiefs -3 (+250)", reply_markup=back_button)
             bot.register_next_step_handler(call.message, broadcast_picks)
         elif data == 'admin_viewsubs':
             subscribers = get_subscriber_details()
@@ -419,19 +417,22 @@ def apply_referral_code(message):
 def broadcast_picks(message):
     if message.from_user.id != ADMIN_ID:
         return
-    picks_input = message.text.strip().split('\n')
     back_button = get_back_button(is_admin=True)
-    if len(picks_input) != 7:
-        bot.send_message(message.chat.id, "❌ Please enter exactly 7 lines: 2 NBA, 2 NFL, 2 MLB, 1 Parlay!", reply_markup=back_button)
+    
+    # Get the raw input from the admin
+    picks_input = message.text.strip()
+    if not picks_input:
+        bot.send_message(message.chat.id, "❌ Please enter at least one pick!", reply_markup=back_button)
         return
 
-    nba_picks = picks_input[0:2]
-    nfl_picks = picks_input[2:4]
-    mlb_picks = picks_input[4:6]
-    parlay_pick = picks_input[6]
-    formatted_picks = format_picks(nba_picks, nfl_picks, mlb_picks, parlay_pick)
+    # Add a simple header with the current date
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    formatted_picks = f"📢 Sports Picks – {current_date}\n\n{picks_input}\n\n"
+    formatted_picks += "🔔 Risk Management Tip: Always bet responsibly and manage your bankroll wisely.\n"
+    formatted_picks += "🚀 Stay ahead. Stay winning!"
 
     try:
+        # Send to test user (for now, later can expand to all subscribers)
         bot.send_message(TEST_USER_ID, formatted_picks)
         bot.send_message(message.chat.id, f"📤 Picks sent to test user {TEST_USER_ID}!", reply_markup=back_button)
         logger.info(f"Admin sent picks to test user {TEST_USER_ID}")

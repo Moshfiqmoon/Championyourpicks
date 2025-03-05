@@ -63,7 +63,7 @@ def is_subscribed(user_id):
         logger.error(f"Error checking subscription for user {user_id}: {e}")
         return False
 
-def update_subscription(user_id, days, payment_link):
+def update_subscription(user_id, days, payment_link="Manually Activated"):
     try:
         end_date = datetime.now() + timedelta(days=days)
         with sqlite3.connect('users.db') as conn:
@@ -71,10 +71,12 @@ def update_subscription(user_id, days, payment_link):
             c.execute("INSERT OR REPLACE INTO users (user_id, subscription_end, payment_status, payment_link) VALUES (?, ?, ?, ?)",
                       (user_id, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active', payment_link))
             conn.commit()
-        bot.send_message(user_id, f"🏆 Payment successful! Your subscription is active until {end_date.strftime('%Y-%m-%d')}! 🚀")
+        bot.send_message(user_id, f"🏆 Your subscription has been activated! It’s active until {end_date.strftime('%Y-%m-%d')}! 🚀")
         logger.info(f"Subscription updated for user {user_id} for {days} days")
+        return end_date
     except Exception as e:
         logger.error(f"Error updating subscription for user {user_id}: {e}")
+        return None
 
 def set_test_user_subscription(user_id):
     try:
@@ -114,7 +116,19 @@ def get_subscriber_details():
         with sqlite3.connect('users.db') as conn:
             c = conn.cursor()
             c.execute("SELECT user_id, subscription_end, payment_status FROM users")
-            return c.fetchall()
+            subscribers = c.fetchall()
+        
+        subscriber_info = []
+        for sub_id, sub_end, status in subscribers:
+            try:
+                user = bot.get_chat(sub_id)
+                name = user.first_name or "Unknown"
+                username = f"@{user.username}" if user.username else "No Username"
+                subscriber_info.append((sub_id, name, username, sub_end, status))
+            except Exception as e:
+                logger.error(f"Error fetching Telegram info for user {sub_id}: {e}")
+                subscriber_info.append((sub_id, "Unknown", "No Username", sub_end, status))
+        return subscriber_info
     except Exception as e:
         logger.error(f"Error fetching subscriber details: {e}")
         return []
@@ -210,7 +224,7 @@ def send_payment_link(user_id, period):
     except Exception as e:
         logger.error(f"Error setting pending subscription for user {user_id}: {e}")
 
-# Preformatted picks template (optional, no longer required)
+# Preformatted picks template (optional)
 def format_picks(nba_picks, nfl_picks, mlb_picks, parlay_pick):
     current_date = datetime.now().strftime('%Y-%m-%d')
     formatted_picks = f"📢 Exclusive Sports Picks – {current_date}\n\n"
@@ -273,6 +287,7 @@ def get_admin_menu():
     markup.add(telebot.types.InlineKeyboardButton("📤 Send Picks", callback_data='admin_sendpicks'))
     markup.add(telebot.types.InlineKeyboardButton("👥 View Subscribers", callback_data='admin_viewsubs'))
     markup.add(telebot.types.InlineKeyboardButton("🗑️ Remove Subscriber", callback_data='admin_removesub'))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Manually Activate", callback_data='admin_activate'))
     return markup
 
 def get_back_button(is_admin=False):
@@ -395,13 +410,16 @@ def handle_callback(call):
                 bot.send_message(user_id, "👥 No subscribers found.", reply_markup=back_button)
                 return
             response = "👥 Subscriber Details:\n"
-            for sub_id, sub_end, status in subscribers:
-                response += f"ID: {sub_id}, End: {sub_end}, Status: {status}\n"
+            for sub_id, name, username, sub_end, status in subscribers:
+                response += f"ID: {sub_id}, Name: {name}, Username: {username}, End: {sub_end}, Status: {status}\n"
             bot.send_message(user_id, response, reply_markup=back_button)
             logger.info("Admin viewed subscribers")
         elif data == 'admin_removesub':
             bot.send_message(user_id, "🗑️ Enter the user ID to remove:", reply_markup=back_button)
             bot.register_next_step_handler(call.message, remove_subscriber)
+        elif data == 'admin_activate':
+            bot.send_message(user_id, "✅ Enter the user ID and days to activate (e.g., '123456789 7' for 7 days):", reply_markup=back_button)
+            bot.register_next_step_handler(call.message, manually_activate_subscription)
     else:
         bot.answer_callback_query(call.id, "🚫 Unauthorized action!")
 
@@ -419,20 +437,17 @@ def broadcast_picks(message):
         return
     back_button = get_back_button(is_admin=True)
     
-    # Get the raw input from the admin
     picks_input = message.text.strip()
     if not picks_input:
         bot.send_message(message.chat.id, "❌ Please enter at least one pick!", reply_markup=back_button)
         return
 
-    # Add a simple header with the current date
     current_date = datetime.now().strftime('%Y-%m-%d')
     formatted_picks = f"📢 Sports Picks – {current_date}\n\n{picks_input}\n\n"
     formatted_picks += "🔔 Risk Management Tip: Always bet responsibly and manage your bankroll wisely.\n"
     formatted_picks += "🚀 Stay ahead. Stay winning!"
 
     try:
-        # Send to test user (for now, later can expand to all subscribers)
         bot.send_message(TEST_USER_ID, formatted_picks)
         bot.send_message(message.chat.id, f"📤 Picks sent to test user {TEST_USER_ID}!", reply_markup=back_button)
         logger.info(f"Admin sent picks to test user {TEST_USER_ID}")
@@ -457,6 +472,29 @@ def remove_subscriber(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"Error removing subscriber: {e}", reply_markup=back_button)
         logger.error(f"Error removing subscriber: {e}")
+
+def manually_activate_subscription(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    back_button = get_back_button(is_admin=True)
+    try:
+        # Expect input in format: "user_id days" (e.g., "123456789 7")
+        user_id, days = map(int, message.text.split())
+        if days <= 0:
+            bot.send_message(message.chat.id, "❌ Days must be a positive number!", reply_markup=back_button)
+            return
+        
+        end_date = update_subscription(user_id, days)
+        if end_date:
+            bot.send_message(message.chat.id, f"✅ Subscription activated for user {user_id} until {end_date.strftime('%Y-%m-%d')}", reply_markup=back_button)
+            logger.info(f"Admin manually activated subscription for user {user_id} for {days} days")
+        else:
+            bot.send_message(message.chat.id, "❌ Failed to activate subscription!", reply_markup=back_button)
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Invalid format. Use: 'user_id days' (e.g., '123456789 7')", reply_markup=back_button)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Error activating subscription: {e}", reply_markup=back_button)
+        logger.error(f"Error in manual activation: {e}")
 
 # Webhook endpoint
 @app.route('/webhook', methods=['POST'])

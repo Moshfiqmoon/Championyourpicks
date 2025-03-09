@@ -1,13 +1,11 @@
 import telebot
-import psycopg2
-import json
-import os
-import logging
-import time
-import boto3
+import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, request
 import stripe
+import threading
+import os
+import logging
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -17,13 +15,10 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', 7933828542))
 STRIPE_API_KEY = os.getenv('STRIPE_API_KEY')
 WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 TEST_USER_ID = 7761809923  # Test user for picks
-PROCESS_TYPE = os.getenv('PROCESS_TYPE', 'web')  # Default to 'web' if not specified
-HEROKU_APP_NAME = os.getenv('HEROKU_APP_NAME', 'championyourpicks-0097fae15cdf')  # Heroku app name
-BOT_USERNAME = os.getenv('BOT_USERNAME', 'ChampionYourPicksBot')  # Replace with your bot's username
-DOMAIN = f'https://{HEROKU_APP_NAME}.herokuapp.com'  # Dynamic Heroku domain
+DOMAIN = os.getenv('DOMAIN', 'http://localhost:4242')  # Default to localhost for testing
 
 # Validate required environment variables
-required_vars = {'TELEGRAM_API_TOKEN': API_TOKEN, 'STRIPE_API_KEY': STRIPE_API_KEY, 'STRIPE_WEBHOOK_SECRET': WEBHOOK_SECRET, 'HEROKU_APP_NAME': HEROKU_APP_NAME, 'BOT_USERNAME': BOT_USERNAME}
+required_vars = {'TELEGRAM_API_TOKEN': API_TOKEN, 'STRIPE_API_KEY': STRIPE_API_KEY, 'STRIPE_WEBHOOK_SECRET': WEBHOOK_SECRET}
 for name, value in required_vars.items():
     if not value:
         raise ValueError(f"Missing required environment variable: {name}")
@@ -33,27 +28,17 @@ bot = telebot.TeleBot(API_TOKEN)
 app = Flask(__name__)
 stripe.api_key = STRIPE_API_KEY
 
-# Initialize S3 client for backup
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
-S3_BUCKET = os.getenv('AWS_S3_BUCKET', 'championyourpicks-backup')  # Default bucket name
-
 # Logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]  # Use StreamHandler on Heroku
+    handlers=[logging.FileHandler('bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Database functions (using Heroku Postgres)
+# Database functions
 def init_db():
-    try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    with sqlite3.connect('users.db') as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS users 
                      (user_id INTEGER PRIMARY KEY, 
@@ -61,22 +46,16 @@ def init_db():
                       payment_status TEXT,
                       payment_link TEXT,
                       referral_code TEXT,
-                      referred_by INTEGER,
-                      stripe_session_id TEXT)''')  # Added stripe_session_id column
+                      referred_by INTEGER)''')
         conn.commit()
-        conn.close()
-        logger.info("Database initialized or updated")
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
+    logger.info("Database initialized or updated")
 
 def is_subscribed(user_id):
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("SELECT subscription_end FROM users WHERE user_id=%s", (user_id,))
-        result = c.fetchone()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("SELECT subscription_end FROM users WHERE user_id=?", (user_id,))
+            result = c.fetchone()
         if result and result[0]:
             return datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S') > datetime.now()
         return False
@@ -84,17 +63,14 @@ def is_subscribed(user_id):
         logger.error(f"Error checking subscription for user {user_id}: {e}")
         return False
 
-def update_subscription(user_id, days, payment_link="Manually Activated", session_id=None):
+def update_subscription(user_id, days, payment_link="Manually Activated"):
     try:
         end_date = datetime.now() + timedelta(days=days)
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("INSERT INTO users (user_id, subscription_end, payment_status, payment_link, stripe_session_id) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_end=%s, payment_status=%s, payment_link=%s, stripe_session_id=%s",
-                  (user_id, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active', payment_link, session_id,
-                   end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active', payment_link, session_id))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO users (user_id, subscription_end, payment_status, payment_link) VALUES (?, ?, ?, ?)",
+                      (user_id, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active', payment_link))
+            conn.commit()
         bot.send_message(user_id, f"🏆 Your subscription has been activated! It’s active until {end_date.strftime('%Y-%m-%d')}! 🚀")
         logger.info(f"Subscription updated for user {user_id} for {days} days")
         return end_date
@@ -105,64 +81,42 @@ def update_subscription(user_id, days, payment_link="Manually Activated", sessio
 def set_test_user_subscription(user_id):
     try:
         end_date = datetime.strptime('2025-12-31 23:59:59', '%Y-%m-%d %H:%M:%S')
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("INSERT INTO users (user_id, subscription_end, payment_status) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_end=%s, payment_status=%s",
-                  (user_id, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active', end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active'))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO users (user_id, subscription_end, payment_status) VALUES (?, ?, ?)",
+                      (user_id, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active'))
+            conn.commit()
         logger.info(f"Test user {user_id} automatically subscribed until {end_date}")
     except Exception as e:
         logger.error(f"Error setting test user subscription for {user_id}: {e}")
 
 def clean_expired_subscriptions():
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("UPDATE users SET payment_status='expired' WHERE subscription_end < %s AND payment_status='active'",
-                  (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("UPDATE users SET payment_status='expired' WHERE subscription_end < ? AND payment_status='active'",
+                      (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
+            conn.commit()
         logger.info("Expired subscriptions cleaned")
     except Exception as e:
         logger.error(f"Error cleaning expired subscriptions: {e}")
 
 def get_all_subscribers():
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE payment_status='active'")
-        subscribers = [row[0] for row in c.fetchall()]
-        conn.close()
-        return subscribers
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM users WHERE payment_status='active'")
+            return [row[0] for row in c.fetchall()]
     except Exception as e:
         logger.error(f"Error fetching subscribers: {e}")
         return []
 
-def get_all_users():
-    try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("SELECT user_id, subscription_end, payment_status, payment_link, referral_code, referred_by, stripe_session_id FROM users")
-        users = c.fetchall()
-        conn.close()
-        return [{"user_id": row[0], "subscription_end": row[1], "payment_status": row[2], "payment_link": row[3], "referral_code": row[4], "referred_by": row[5], "stripe_session_id": row[6]} for row in users]
-    except Exception as e:
-        logger.error(f"Error fetching all users: {e}")
-        return []
-
 def get_subscriber_details():
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("SELECT user_id, subscription_end, payment_status FROM users")
-        subscribers = c.fetchall()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id, subscription_end, payment_status FROM users")
+            subscribers = c.fetchall()
         
         subscriber_info = []
         for sub_id, sub_end, status in subscribers:
@@ -181,39 +135,21 @@ def get_subscriber_details():
 
 def get_user_subscription(user_id):
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("SELECT subscription_end, payment_status FROM users WHERE user_id=%s", (user_id,))
-        result = c.fetchone()
-        conn.close()
-        return result
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("SELECT subscription_end, payment_status FROM users WHERE user_id=?", (user_id,))
+            return c.fetchone()
     except Exception as e:
         logger.error(f"Error fetching subscription for user {user_id}: {e}")
-        return None
-
-def get_user_by_session_id(session_id):
-    try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE stripe_session_id=%s", (session_id,))
-        result = c.fetchone()
-        conn.close()
-        return result[0] if result else None
-    except Exception as e:
-        logger.error(f"Error fetching user by session ID {session_id}: {e}")
         return None
 
 def generate_referral_code(user_id):
     code = f"REF{user_id}{datetime.now().strftime('%H%M%S')}"
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("UPDATE users SET referral_code=%s WHERE user_id=%s", (code, user_id))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("UPDATE users SET referral_code=? WHERE user_id=?", (code, user_id))
+            conn.commit()
         return code
     except Exception as e:
         logger.error(f"Error generating referral code for user {user_id}: {e}")
@@ -221,57 +157,21 @@ def generate_referral_code(user_id):
 
 def use_referral_code(user_id, code):
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE referral_code=%s", (code,))
-        referrer = c.fetchone()
-        if referrer and referrer[0] != user_id:
-            c.execute("UPDATE users SET referred_by=%s WHERE user_id=%s", (referrer[0], user_id))
-            conn.commit()
-            bot.send_message(referrer[0], "🎁 Someone used your referral code! You’ll get a bonus soon!")
-            bot.send_message(user_id, "✅ Referral code applied! Enjoy your subscription!")
-            logger.info(f"User {user_id} used referral code {code} from {referrer[0]}")
-            conn.close()
-            return True
-        conn.close()
-        return False
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM users WHERE referral_code=?", (code,))
+            referrer = c.fetchone()
+            if referrer and referrer[0] != user_id:
+                c.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer[0], user_id))
+                conn.commit()
+                bot.send_message(referrer[0], "🎁 Someone used your referral code! You’ll get a bonus soon!")
+                bot.send_message(user_id, "✅ Referral code applied! Enjoy your subscription!")
+                logger.info(f"User {user_id} used referral code {code} from {referrer[0]}")
+                return True
+            return False
     except Exception as e:
         logger.error(f"Error using referral code for user {user_id}: {e}")
         return False
-
-# Backup and restore functions using S3
-def backup_users():
-    try:
-        users = get_all_users()
-        # Save to a temporary file
-        with open('/tmp/users_backup.json', 'w') as f:
-            json.dump(users, f, indent=4)
-        # Upload to S3
-        s3_client.upload_file('/tmp/users_backup.json', S3_BUCKET, 'users_backup.json')
-        logger.info("Backed up user data to S3")
-    except Exception as e:
-        logger.error(f"Error backing up user data to S3: {e}")
-
-def restore_users_from_backup():
-    try:
-        # Download from S3
-        s3_client.download_file(S3_BUCKET, 'users_backup.json', '/tmp/users_backup.json')
-        with open('/tmp/users_backup.json', 'r') as f:
-            users = json.load(f)
-        
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        for user in users:
-            c.execute("INSERT INTO users (user_id, subscription_end, payment_status, payment_link, referral_code, referred_by, stripe_session_id) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_end=%s, payment_status=%s, payment_link=%s, referral_code=%s, referred_by=%s, stripe_session_id=%s",
-                      (user['user_id'], user['subscription_end'], user['payment_status'], user['payment_link'], user['referral_code'], user['referred_by'], user.get('stripe_session_id'),
-                       user['subscription_end'], user['payment_status'], user['payment_link'], user['referral_code'], user['referred_by'], user.get('stripe_session_id')))
-        conn.commit()
-        conn.close()
-        logger.info("Restored user data from S3 backup")
-    except Exception as e:
-        logger.error(f"Error restoring user data from S3 backup: {e}")
 
 # Stripe Checkout Session Creation
 def create_checkout_session(user_id, period):
@@ -291,17 +191,10 @@ def create_checkout_session(user_id, period):
                 'quantity': 1,
             }],
             mode='payment',
-            success_url=f'https://t.me/{BOT_USERNAME}?start=success_{{CHECKOUT_SESSION_ID}}',  # Redirect to Telegram bot
-            cancel_url=f'https://t.me/{BOT_USERNAME}?start=cancel',  # Redirect to Telegram bot on cancel
+            success_url=f'{DOMAIN}/success',
+            cancel_url=f'{DOMAIN}/cancel',
             metadata={'user_id': str(user_id), 'days': str(days)}
         )
-        # Store the session ID in the database
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("UPDATE users SET stripe_session_id=%s WHERE user_id=%s", (session.id, user_id))
-        conn.commit()
-        conn.close()
         return session.url
     except Exception as e:
         logger.error(f"Error creating checkout session for user {user_id}: {e}")
@@ -318,13 +211,11 @@ def send_payment_link(user_id, period):
         bot.send_message(user_id, "❌ Error generating payment link. Try again later.")
         return
     try:
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("INSERT INTO users (user_id, payment_status, payment_link) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET payment_status=%s, payment_link=%s",
-                  (user_id, 'pending', checkout_url, 'pending', checkout_url))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO users (user_id, payment_status, payment_link) VALUES (?, ?, ?)",
+                      (user_id, 'pending', checkout_url))
+            conn.commit()
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(telebot.types.InlineKeyboardButton(f"Pay ${price}/{period}", url=checkout_url))
         markup.add(telebot.types.InlineKeyboardButton("🔙 Back to Menu", callback_data='back_to_main'))
@@ -333,7 +224,7 @@ def send_payment_link(user_id, period):
     except Exception as e:
         logger.error(f"Error setting pending subscription for user {user_id}: {e}")
 
-# Preformatted picks template
+# Preformatted picks template (optional)
 def format_picks(nba_picks, nfl_picks, mlb_picks, parlay_pick):
     current_date = datetime.now().strftime('%Y-%m-%d')
     formatted_picks = f"📢 Exclusive Sports Picks – {current_date}\n\n"
@@ -410,28 +301,6 @@ def get_back_button(is_admin=False):
 def send_welcome(message):
     clean_expired_subscriptions()
     user_id = message.from_user.id
-    command = message.text.split()
-
-    # Handle redirection from Stripe
-    if len(command) > 1:
-        param = command[1]
-        if param.startswith('success_'):
-            session_id = param.replace('success_', '')
-            user_id_from_session = get_user_by_session_id(session_id)
-            if user_id_from_session and user_id_from_session == user_id:
-                if is_subscribed(user_id):
-                    markup = get_user_menu(user_id)
-                    bot.reply_to(message, "🎉 Payment successful! Your subscription is active. Welcome to the VIP club!", reply_markup=markup)
-                else:
-                    markup = get_user_menu(user_id)
-                    bot.reply_to(message, "✅ Payment received! Your subscription should be active shortly. If not, please contact support.", reply_markup=markup)
-            else:
-                bot.reply_to(message, "❌ Invalid session ID or user mismatch. Please contact support.")
-            return
-        elif param == 'cancel':
-            markup = get_user_menu(user_id)
-            bot.reply_to(message, "❌ Payment was cancelled. You can try again anytime!", reply_markup=markup)
-            return
 
     if user_id == TEST_USER_ID:
         set_test_user_subscription(user_id)
@@ -601,12 +470,10 @@ def remove_subscriber(message):
     back_button = get_back_button(is_admin=True)
     try:
         user_id = int(message.text)
-        DATABASE_URL = os.getenv('DATABASE_URL')
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        c = conn.cursor()
-        c.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect('users.db') as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+            conn.commit()
         bot.send_message(message.chat.id, f"🗑️ User {user_id} removed from subscribers!", reply_markup=back_button)
         logger.info(f"Admin removed user {user_id}")
     except ValueError:
@@ -650,52 +517,40 @@ def webhook():
 
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
-        payment_status = session.get('payment_status')
-        if payment_status != 'paid':
-            logger.error(f"Payment not completed for session {session.get('id')}, status: {payment_status}")
-            return 'Payment not completed', 400
-
         user_id = session.get('metadata', {}).get('user_id')
         days = int(session.get('metadata', {}).get('days', 7))  # Default to 7 if missing
-        session_id = session.get('id')
         if not user_id:
             logger.error("No user_id in metadata")
             return 'No user_id', 400
 
         try:
-            user_id = int(user_id)  # Ensure user_id is an integer
-            update_subscription(user_id, days, session.get('payment_link_url', 'Stripe Webhook'), session_id)
-            logger.info(f"Webhook updated subscription for user {user_id} with {days} days")
+            with sqlite3.connect('users.db') as conn:
+                c = conn.cursor()
+                c.execute("SELECT payment_link FROM users WHERE user_id=? AND payment_status='pending'", (int(user_id),))
+                result = c.fetchone()
+                if result:
+                    payment_link = result[0]
+                    update_subscription(int(user_id), days, payment_link)
+                    logger.info(f"Webhook updated subscription for user {user_id} with {days} days")
+                else:
+                    logger.error(f"User {user_id} not found or not pending")
         except Exception as e:
             logger.error(f"Webhook processing error for user {user_id}: {e}")
-            return 'Webhook processing error', 500
     return 'Success', 200
 
-# Run bot and webhook server based on process type
+# Run bot and webhook server
 if __name__ == "__main__":
     init_db()
-    restore_users_from_backup()  # Restore user data from S3 on startup
     clean_expired_subscriptions()
     logger.info("Starting bot and webhook server...")
 
+    def run_flask():
+        app.run(host='0.0.0.0', port=4242)
+
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+
     try:
-        if PROCESS_TYPE == 'web':
-            # Run Flask server for web process
-            port = int(os.getenv('PORT', 4242))  # Use Heroku's PORT
-            app.run(host='0.0.0.0', port=port)
-        elif PROCESS_TYPE == 'worker':
-            # Run Telegram bot polling for worker process
-            while True:
-                try:
-                    bot.polling(none_stop=True)
-                except Exception as e:
-                    logger.error(f"Bot polling error: {e}, restarting...")
-                    time.sleep(5)  # Wait before retrying
-    except KeyboardInterrupt:
-        logger.info("Bot shutting down, creating backup...")
-        backup_users()  # Backup user data to S3 on shutdown
-        raise
+        bot.polling(none_stop=True)
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        backup_users()  # Backup user data to S3 on unexpected shutdown
-        raise
+        logger.error(f"Bot polling error: {e}")
